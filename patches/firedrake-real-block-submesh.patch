@@ -1,0 +1,82 @@
+--- a/firedrake/formmanipulation.py
++++ b/firedrake/formmanipulation.py
+@@ -280,3 +280,49 @@
+         f = splitter.split(form, idx)
+         forms.append(SplitForm(indices=idx[:rank], form=f))
+     return tuple(forms)
++
++
++class _IdentityInliner(MultiFunction):
++    """Replace ``I[i, j]``, both indices fixed, by the Kronecker delta."""
++
++    expr = MultiFunction.reuse_if_untouched
++
++    def multi_index(self, o):
++        return o
++
++    def indexed(self, o, child, multiindex):
++        from ufl.classes import Identity
++        from ufl.constantvalue import IntValue
++        if isinstance(child, Identity):
++            indices = multiindex.indices()
++            if len(indices) == 2 and all(isinstance(i, FixedIndex) for i in indices):
++                i, j = (int(k) for k in indices)
++                return IntValue(1) if i == j else Zero()
++        return self.expr(o, child, multiindex)
++
++
++def drop_zero_blocks(a):
++    """Simplify a form so that structurally-zero mixed sub-blocks vanish.
++
++    When a sub-block is extracted from a mixed form and its arguments are
++    replaced by ones on the collapsed sub-space -- as the matrix-free operators
++    and the assembled preconditioners do -- the components that were zeroed out
++    survive as ``I[i, j] * grad(v)`` products that UFL never folds away. That is
++    harmless for a single-mesh form, but on a mixed space spanning several
++    meshes it leaves an integral over one mesh syntactically referring to an
++    argument on another, which the form compiler rejects with a
++    ``MismatchingDomainError``. Folding the fixed-index identities turns those
++    terms into literal zeros, and the zero integrals are then dropped.
++
++    Only forms spanning more than one mesh are touched; everything else is
++    returned unchanged.
++    """
++    from ufl import Form
++    from ufl.algorithms import expand_derivatives
++    from ufl.algorithms.remove_component_tensors import remove_component_tensors
++    from ufl.domain import extract_domains
++
++    if not isinstance(a, Form) or len(extract_domains(a)) < 2:
++        return a
++    return map_integrand_dags(_IdentityInliner(),
++                              remove_component_tensors(expand_derivatives(a)))
+--- a/firedrake/preconditioners/base.py
++++ b/firedrake/preconditioners/base.py
+@@ -103,7 +103,11 @@
+             a = ctx.Jp or ctx.J
+             bcs = ctx.bcs_Jp
+         if len(args):
+-            a = a(*args)
++            from firedrake.formmanipulation import drop_zero_blocks
++            # Replacing the arguments by ones on the collapsed sub-space leaves
++            # structurally-zero terms naming the other meshes of a multi-mesh
++            # form; the form compiler rejects those. No-op otherwise.
++            a = drop_zero_blocks(a(*args))
+         return a, bcs
+ 
+     @staticmethod
+--- a/firedrake/matrix_free/operators.py
++++ b/firedrake/matrix_free/operators.py
+@@ -91,7 +91,12 @@
+     def __init__(self, a, row_bcs=[], col_bcs=[],
+                  fc_params=None, appctx=None):
+         from firedrake.assemble import get_assembler
++        from firedrake.formmanipulation import drop_zero_blocks
+ 
++        # Sub-blocks extracted from a mixed form keep structurally-zero terms
++        # that still name the other meshes of a multi-mesh form; the form
++        # compiler rejects those. No-op for single-mesh forms.
++        a = drop_zero_blocks(a)
+         self.a = a
+         self.aT = adjoint(a)
+         self.comm = a.arguments()[0].function_space().comm

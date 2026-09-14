@@ -1,0 +1,6 @@
+output/
+__pycache__/
+*.egg-info/
+.DS_Store
+CLAUDE.md
+!patches/README.txt

@@ -1,0 +1,91 @@
+--- a/firedrake/mesh.py
++++ b/firedrake/mesh.py
+@@ -3109,8 +3109,80 @@
+     mesh._did_reordering = orig_mesh._did_reordering
+     mesh._distribution_parameters = orig_mesh._distribution_parameters
+     return mesh
++
++
++def _localize_submesh_coordinates(subplex, plex):
++    """Give a submesh of a periodic mesh its cell-wise (localized) coordinates.
++
++    ``DMPlexFilter`` marks the submesh as having localized coordinates -- it
++    copies the parent's coordinate dimension into the cell coordinate field --
++    but never fills the cell coordinate vector in, and ``DMLocalizeCoordinates``
++    then declines to do it because the flag it keys off is already set. Reading
++    the empty vector is what makes ``Submesh`` of a periodic mesh segfault.
++
++    We cannot simply ask PETSc to redo the localization: the flag lives in
++    ``dm->coordinates[1].dim`` and has no public setter. Nor can we hand the
++    submesh its own periodicity, because ``DMSetPeriodicity`` sizes ``maxCell``,
++    ``Lstart`` and ``L`` by the *topological* dimension, which on a submesh is
++    smaller than the coordinate dimension -- the arrays the filter copied over
++    are too short to index, and reading them past the end is the other half of
++    the crash. So we localize by hand here, taking the periodicity from the
++    parent, where topological and coordinate dimension agree.
+ 
++    A no-op unless the parent is periodic.
++    """
++    if not plex.getCoordinatesLocalized():
++        return
++    if subplex.getCellCoordinatesLocal().getSize() > 0:
++        # Already populated: nothing to repair.
++        return
+ 
++    gdim = subplex.getCoordinateDim()
++    maxCell, _, L = plex.getPeriodicity()
++    if len(L) < gdim:
++        raise NotImplementedError(
++            f"Parent periodicity has {len(L)} entries but the coordinates are "
++            f"{gdim}-dimensional; cannot localize the submesh."
++        )
++
++    cStart, cEnd = subplex.getHeightStratum(0)
++    coord_sec = subplex.getCoordinateSection()
++    coord_vec = subplex.getCoordinatesLocal()
++    dofs_per_cell = len(subplex.vecGetClosure(coord_sec, coord_vec, cStart))
++
++    sec = PETSc.Section().create(comm=PETSc.COMM_SELF)
++    sec.setNumFields(1)
++    sec.setFieldComponents(0, gdim)
++    sec.setChart(cStart, cEnd)
++    for c in range(cStart, cEnd):
++        sec.setDof(c, dofs_per_cell)
++        sec.setFieldDof(c, 0, dofs_per_cell)
++    sec.setUp()
++
++    vec = PETSc.Vec().create(comm=PETSc.COMM_SELF)
++    vec.setSizes((sec.getStorageSize(), PETSc.DETERMINE), gdim)
++    vec.setType(coord_vec.getType())
++    arr = vec.array
++
++    for c in range(cStart, cEnd):
++        x = subplex.vecGetClosure(coord_sec, coord_vec, c).reshape(-1, gdim).copy()
++        # Bring every vertex of the cell within maxCell of the first one, the
++        # anchor PETSc's own localization uses, so that a cell straddling the
++        # periodic seam is contiguous rather than wrapping the whole domain.
++        anchor = x[0].copy()
++        for d in range(gdim):
++            if L[d] > 0:
++                offset = x[:, d] - anchor[d]
++                wrapped = np.abs(offset) > maxCell[d]
++                x[wrapped, d] -= L[d] * np.round(offset[wrapped] / L[d])
++        off = sec.getOffset(c)
++        arr[off:off + dofs_per_cell] = x.reshape(-1)
++
++    subplex.setCellCoordinateDM(subplex.getCoordinateDM().clone())
++    subplex.setCellCoordinateSection(gdim, sec)
++    subplex.setCellCoordinatesLocal(vec)
++
++
+ def _fully_localize_coordinates(dm):
+     """Expand sparsely localized coordinates to cover all cells.
+ 
+@@ -5015,6 +5087,7 @@
+     subplex.setName(_generate_default_mesh_topology_name(name))
+     if subplex.getDimension() != subdim:
+         raise RuntimeError(f"Found subplex dim ({subplex.getDimension()}) != expected ({subdim})")
++    _localize_submesh_coordinates(subplex, plex)
+     if reorder is None:
+         # Ideally we should set perm_is = mesh._dm_renumbering[label_indices]
+         reorder = mesh._did_reordering
